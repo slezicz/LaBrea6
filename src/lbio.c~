@@ -1,0 +1,281 @@
+/*
+ * lbio.c
+ *
+ *  Created on: May 13, 2010
+ *      Author: slezi
+ */
+
+#include <err.h>
+#include <pcap.h>
+#include <string.h>
+#include <sys/types.h>
+#include <time.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <linux/if_ether.h>
+#include <netinet/ip6.h>
+#include <netinet/icmp6.h>
+/*this is because of tcp header definition */
+#ifndef __FAVOR_BSD
+#define __FAVOR_BSD
+#endif
+#include <netinet/tcp.h>
+#include <stdlib.h>
+#include "labrea6.h"
+#include "lbio.h"
+#include "utils.h"
+#include "pcaputil.h"
+#include "pkt.h"
+#include "ctl.h"
+
+void
+lbio_init(u_char *dev, u_char *texpr)
+{
+  /* open the network device */
+  if ((io.pcap = pcap_open(dev)) == NULL)
+    {
+      warnx("*** Couldn't open pcap device for sniffing");
+      util_clean_exit(1);
+    }
+  util_print(NORMAL, "Initiated on interface: %s", dev);
+
+  /* compile our BPF filter and attach it to the datalink */
+  if (pcap_filter(io.pcap, texpr) < 0)
+    {
+      warnx(
+          "*** Either pcap filter is invalid or error in activation of filter");
+      util_clean_exit(1);
+    }
+}
+/*
+ * compute an IP header checksum.
+ * don't modifiy the packet.
+ */
+u_short
+lbio_in_cksum(const u_short *addr, register u_int len, int csum)
+{
+  int nleft = len;
+  const u_short *w = addr;
+  u_short answer;
+  int sum = csum;
+
+  /*
+   *  Our algorithm is simple, using a 32 bit accumulator (sum),
+   *  we add sequential 16 bit words to it, and at the end, fold
+   *  back all the carry bits from the top 16 bits into the lower
+   *  16 bits.
+   */
+  while (nleft > 1)
+    {
+      sum += *w++;
+      nleft -= 2;
+    }
+  if (nleft == 1)
+    sum += htons(*(u_char *) w << 8);
+
+  /*
+   * add back carry outs from top 16 bits to low 16 bits
+   */
+  sum = (sum >> 16) + (sum & 0xffff); /* add hi 16 to low 16 */
+  sum += (sum >> 16); /* add carry */
+  answer = ~sum; /* truncate to 16 bits */
+  return (answer);
+}
+
+/*
+ * Compute a V6-style checksum by building a pseudoheader.
+ */
+int
+lbio_nextproto6_cksum(const struct ip6_hdr *ip6, const u_short *data,
+    u_int len, u_int next_proto)
+{
+  size_t i;
+  u_int32_t sum = 0;
+  union ip6_pseudo_hdr phu;
+
+  /* pseudo-header */
+  memset(&phu, 0, sizeof(phu));
+  phu.ph.ph_src = ip6->ip6_src;
+  phu.ph.ph_dst = ip6->ip6_dst;
+  phu.ph.ph_len = htonl(len);
+  phu.ph.ph_nxt = next_proto;
+
+  for (i = 0; i < sizeof(phu.pa) / sizeof(phu.pa[0]); i++)
+    {
+      sum += phu.pa[i];
+    }
+
+  return lbio_in_cksum(data, len, sum);
+}
+
+int
+lbio_send_pkt(u_char* packet, int len)
+{
+  int ret = pcap_sendpacket(io.pcap, packet, len); /* send the packet to the network */
+  free_packet(packet); /* free the packet from mem*/
+
+  return ret;
+}
+
+int
+lbio_send_echo_reply(u_char* packet, int len)
+{
+  struct ethhdr *eth = (struct ethhdr*) (packet);
+  struct ip6_hdr *ip6 = (struct ip6_hdr*) (packet + ETH_HLEN);
+  struct icmp6_hdr *icmp6 = (struct icmp6_hdr*) (packet
+      + sizeof(struct ip6_hdr) + sizeof(struct ethhdr));
+
+  /* change type to reply */
+  icmp6->icmp6_type = ICMP6_ECHO_REPLY;
+
+  /* now we create reply packet, by swaping src addrs to dest etc. */
+
+  //ETH
+  /* set the Ethernet addresses*/
+  memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+  memcpy(eth->h_source, ETH_ADDR_BOGUS, ETH_ALEN);
+
+  //IPv6
+  /* set the IP addresses*/
+  struct in6_addr ip_old_dest;
+  ip_old_dest = ip6->ip6_dst;
+  ip6->ip6_dst = ip6->ip6_src;
+  ip6->ip6_src = ip_old_dest;
+
+  ip6->ip6_hops = ECHO_HOPS; /* set hops to the default */
+
+  /*finally we have to do chechsum */
+  int datalen = len - (ETH_HLEN + sizeof(struct ip6_hdr)); /* count data length */
+  icmp6->icmp6_cksum = 0; /* have to set the checksum to zero before computing */
+  icmp6->icmp6_cksum = lbio_nextproto6_cksum(ip6, (u_short *) icmp6, datalen,
+      IPPROTO_ICMPV6); /* compute the checksum */
+  char dst[INET6_ADDRSTRLEN], src[INET6_ADDRSTRLEN];
+
+  if (lbio_send_pkt(packet, len) < 0) /*send*/
+    warnx("*** Problem sending packet");
+  else
+    util_print(VERBOSE, "%s: %s -> %s", "Responded to ping",
+        inet_ntop(AF_INET6, &ip6->ip6_dst, dst, INET6_ADDRSTRLEN),
+        inet_ntop(AF_INET6, &ip6->ip6_src, src, INET6_ADDRSTRLEN));
+  return 0;
+}
+
+int
+lbio_send_neighbor_adv(u_char* packet, int len)
+{
+  struct ethhdr *eth = (struct ethhdr*) (packet);
+  struct ip6_hdr *ip6 = (struct ip6_hdr*) (packet + ETH_HLEN);
+  struct nd_neighbor_advert *icmp6 = (struct nd_neighbor_advert*) (packet
+      + sizeof(struct ip6_hdr) + ETH_HLEN);
+  struct nd_opt_hdr *icmp6_opt;
+
+  /* otherwise we assume that sender sends opt header also */
+  icmp6_opt = (struct nd_opt_hdr*) (packet + sizeof(struct ethhdr)
+      + sizeof(struct ip6_hdr) + sizeof(struct nd_neighbor_solicit));
+
+  icmp6->nd_na_type = ND_ROUTER_ADVERT; /* set the type */
+  icmp6->nd_na_flags_reserved = ND_NA_FLAG_SOLICITED; /* set flags */
+
+  /* in units of 8 octets */
+  icmp6_opt->nd_opt_len = 1;
+  icmp6_opt->nd_opt_type = ND_OPT_TARGET_LINKADDR;
+  memcpy((icmp6_opt + 1), ETH_ADDR_BOGUS, ETH_ALEN);
+
+  /* change type to ND adv */
+  icmp6->nd_na_hdr.icmp6_type = ND_NEIGHBOR_ADVERT;
+  /* answer with bogus mac */
+
+  /* now we create reply packet, by swaping src addrs to dest etc. */
+
+  //ETH
+  memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+  memcpy(eth->h_source, ETH_ADDR_BOGUS, ETH_ALEN);
+
+  //IPv6
+  ip6->ip6_dst = ip6->ip6_src;
+
+  /* assign target ip to src field */
+  ip6->ip6_src = icmp6->nd_na_target;
+
+  /*finally we have to do chechsum */
+  int datalen = len - (ETH_HLEN + sizeof(struct ip6_hdr));
+  //warnx("data len=%d", datalen);
+  icmp6->nd_na_cksum = 0;/* have to set the checksum to zero before computing */
+  icmp6->nd_na_cksum = lbio_nextproto6_cksum(ip6, (u_short *) icmp6, datalen,
+      IPPROTO_ICMPV6);/* compute the checksum */
+
+  char dst[INET6_ADDRSTRLEN], src[INET6_ADDRSTRLEN];
+  if (lbio_send_pkt(packet, len) < 0) /*send */
+    warnx("*** Problem sending packet");
+  else
+    util_print(VERY_VERBOSE, "%s: %s -> %s", "Responded to Neighbor Discovery",
+            inet_ntop(AF_INET6, &ip6->ip6_dst, dst, INET6_ADDRSTRLEN),
+            inet_ntop(AF_INET6, &ip6->ip6_src, src, INET6_ADDRSTRLEN));
+
+  return 0;
+}
+
+int
+lbio_send_tcp(u_char* packet, int len, char* msg)
+{
+  u_int16_t tmpport;
+
+  struct ethhdr *eth = (struct ethhdr*) (packet);
+  struct ip6_hdr *ip6 = (struct ip6_hdr*) (packet + ETH_HLEN);
+  struct tcphdr *tcp =(struct tcphdr*) (packet + ETH_HLEN + sizeof(struct ip6_hdr)); /* The TCP header */
+
+
+  //ETH
+  memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+  memcpy(eth->h_source, ETH_ADDR_BOGUS, ETH_ALEN);
+
+  //IPv6
+  struct in6_addr ip_old_dest;
+  ip_old_dest = ip6->ip6_dst;
+  ip6->ip6_dst = ip6->ip6_src;
+  ip6->ip6_src = ip_old_dest;
+
+  //TCP
+  /* reverse ports src-> dst, dst->src */
+  tmpport = tcp->th_sport;
+  tcp->th_sport = tcp->th_dport;
+  tcp->th_dport = tmpport;
+  int datalen = len - (ETH_HLEN + sizeof(struct ip6_hdr));
+
+  tcp->th_sum =0; /* chcksum to zero before computing */
+  tcp->th_sum = lbio_nextproto6_cksum(ip6, (u_short *) tcp, datalen,
+      IPPROTO_TCP); /*compute chcksum */
+
+  char dst[INET6_ADDRSTRLEN], src[INET6_ADDRSTRLEN];
+  if (lbio_send_pkt(packet, len) < 0) /*send packet */
+      warnx("*** Problem sending packet");
+  else
+    util_print(VERBOSE, "%s: %s %i -> %s %i ", msg,
+        inet_ntop(AF_INET6, &ip6->ip6_dst, dst, INET6_ADDRSTRLEN), ntohs(tcp->th_dport),
+        inet_ntop(AF_INET6, &ip6->ip6_src, src, INET6_ADDRSTRLEN), ntohs(tcp->th_sport));
+
+    return 0;
+}
+
+/*
+ * Close I/O and associated services
+ *
+ */
+void
+lbio_close(void)
+{
+  struct pcap_stat stat;
+
+  /* clean up our pcap stuff */
+  if (io.pcap != NULL)
+    {
+      /* show 'em some stats... */
+      if (pcap_stats(io.pcap, &stat) >= 0)
+        {
+          util_print(NORMAL, "%d/%d packets (received/dropped) by filter",
+              stat.ps_recv, stat.ps_drop);
+        }
+      pcap_close(io.pcap);
+    }
+
+}

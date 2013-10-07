@@ -1,0 +1,57 @@
+#!/usr/bin/perl -w
+
+use DBI qw(:sql_types);
+use Socket;
+
+my $host = "localhost"; 
+my $db = "labrea"; 
+my $table = "tarpit"; 
+my $user = "labrea"; 
+my $pass = "Labrea6*";
+
+
+my $dbh=undef;
+$| = 1;
+
+# do magic here ;))
+# but if you make data in mysql int(10) unsigned 
+# it works with mysql::inet_ntoa, php::ip2long, perl::down below
+# someday i'll find out why
+# We don't need the magic for ipv6...
+sub ip2long { return unpack("N*", inet_aton(shift)); }
+
+sub long2ip { return inet_ntoa(pack("N*", shift)); }
+
+sub dbconnect() {
+	# nechci aby to chcipalo ale aby se to zkusilo znova napojovat
+	while($dbh == undef) {
+		$dbh = DBI->connect( "DBI:mysql:host=$host;database=$db", $user, $pass, {RaiseError => 0, AutoCommit => 1} ) #; 
+		|| die "Database connection not made: $DBI::errstr";
+	}
+}
+
+dbconnect();
+
+my $sql_tarpit = "insert into tarpit (time, ipsrc, psrc, ipdst, pdst) values (";
+my $sql_bw = "insert into labrea (time, bw) values (";
+
+my $l;
+my @tmp;
+while($l = <STDIN>) {
+	if( $l =~ m/Initial Connect - tarpitting:/ ) {
+		@tmp = split(" ", $l);
+		$dbh->do( $sql_tarpit."$tmp[0], '$tmp[5]', $tmp[6], '$tmp[8]', $tmp[9])" );
+		#$dbh->do( $sql_tarpit."$tmp[0],".ip2long($tmp[5]).",$tmp[6],".ip2long($tmp[8]).",$tmp[9])" );
+	}
+	if( $l =~ m/Current average bw/) {
+		@tmp = split(" ", $l);
+		$dbh->do($sql_bw."$tmp[0], $tmp[4])"); 
+	}
+	if($DBI::err) {
+		print("ERROR: insert failed $DBI::errstr\n");
+		$dbh=undef;
+		dbconnect(); 
+	}
+	print $l; #let logs flow
+}
+$dbh->disconnect();

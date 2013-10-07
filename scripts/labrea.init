@@ -1,0 +1,59 @@
+#!/bin/bash
+#
+NAME="LaBrea6"
+
+BASE="/root/deploy/${NAME}"
+OPTIONS=""
+USER="root" #labrea musi bezet jako root
+PIDFILE="$BASE/var/labrea.pid"
+LOGFILE="$BASE/var/labrea.log"
+LABREA_BIN="${BASE}/bin/LaBrea6"
+SCRIPTS="scripts/"
+START="${LABREA_BIN} -i eth0 -I 2001:718:1801:1238:216:3eff:fe23:8002"
+#-a ${BASE}/bin/addrs"
+#STOP="kill -TERM `cat $PIDFILE`"
+STOP="killall -TERM $LABREA_BIN"
+
+cd $BASE
+
+case "$1" in
+  start)
+	echo -n "Starting $NAME: "
+        #${START} 2>/dev/null </dev/null | grep --line-buffered -v -f ${BASE}/labrea.ignore >> $LOGFILE 2>/dev/null & 
+        ${START} 2>/dev/null </dev/null | grep --line-buffered -v -f ${BASE}/${SCRIPTS}/labrea.ignore | ${BASE}/${SCRIPTS}/labrea.loadup >> $LOGFILE 2>/dev/null & 
+	echo "done"
+	;;
+  stop)
+	echo -n "Stopping $NAME: "
+	$STOP
+	echo "done"
+	;;
+  force-reload|restart)
+	$0 stop
+	sleep 3
+	$0 start
+	;;
+  log)
+  	tail -f ${BASE}/var/*log 
+	;;
+  rotate)
+    	echo -n "rotating ${NAME} logs to BEFORE* dirs.."
+	D=${BASE}/BEFORE_`date +%Y-%m-%d_%T`
+	/bin/mkdir $D
+	/bin/mv ${BASE}/var/* $D/
+	echo "done"
+   ;;
+   report|rep)
+   	cat ${BASE}/var/labrea.log | ${BASE}/labrea_report.pl | less
+   ;;
+   debug)
+   	#chpax -permsx ${BASE}/bin/nepenthes
+	#gdb -d /opt/mysphere1/src/nepenthes-trunk/nepenthes-core/src ${BASE}/bin/nepenthes
+   ;;
+   *)
+	echo "Usage: $0 {start|stop|restart|force-reload}"
+	ps faxu | grep labrea
+	exit 1
+esac
+
+exit 0
